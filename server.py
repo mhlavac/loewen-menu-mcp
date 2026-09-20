@@ -229,6 +229,152 @@ def _parse_order_history(html: str) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Helper: classify a meal (pure, best-effort German keyword heuristic)
+# ---------------------------------------------------------------------------
+#
+# classify_meal is a *best-effort, heuristic* tagger. It does NOT consult an
+# allergen database or the IBS5 ingredient list — it only pattern-matches on
+# the human-readable dish name. Treat the output as advisory.
+#
+# Keyword table (all matched case-insensitively as substrings of the dish name):
+#
+#   pork    : schwein, kassler, kassel, speck, schinken, bacon, wurst, bratwurst,
+#             salami, leberkäs, leberkas, sülze, suelze, eisbein, kasseler,
+#             schweine, gulasch (NOTE: ambiguous — see below)
+#   beef     : rind, beef, gulasch, hack, hackfleisch, frikadelle, bulette,
+#             boulette, tafelspitz, roulade, sauerbraten, gyros, döner, doener,
+#             kalb, ragout (ambiguous — see below)
+#   poultry  : huhn, hühn, huehn, hähnchen, haehnchen, hahnchen, geflügel,
+#             gefluegel, pute, puten, truthahn, chicken, poulet
+#   fish     : fisch, lachs, seelachs, kabeljau, thunfisch, forelle, scholle,
+#             hering, garnel, shrimp, fischstäbchen, fischstaebchen, alaska,
+#             pangasius, sea
+#   egg      : ei, eier, eies, omelett, rührei, ruehrei, spiegelei, frikassee
+#             (NOTE: "frikassee" is egg-y only when not preceded by a meat word;
+#              handled by precedence below)
+#   sweet    : süß, suess, pudding, milchreis, grießbrei, griessbrei, apfelmus,
+#             pfannkuchen, kaiserschmarrn, schmarrn, kuchen, waffel, quark,
+#             dessert, kompott, vanille, schokolad, zimt, mus, datsch, palatschin,
+#             rote grütze, gruetze, kaltschale, reis mit, germknödel, knödel mit
+#
+# Precedence / disambiguation rules:
+#   - "gulasch"/"ragout" alone are ambiguous. We resolve them by the qualifier
+#     in the name: "...vom huhn"/"...geflügel" -> poultry, "fisch..." -> fish,
+#     "wurst..." -> pork, otherwise default a bare "gulasch" to beef and a bare
+#     "ragout" to NOT add a meat category (too generic) unless another keyword
+#     fires. "wurstgulasch" -> pork (wurst wins).
+#   - "frikassee" implies egg ONLY if no meat keyword (poultry/pork/beef/fish)
+#     matched, e.g. "Eierfrikassee" -> egg, but "Hühnerfrikassee" -> poultry.
+#   - vegetarian == True iff NONE of pork/beef/poultry/fish matched. egg does NOT
+#     break vegetarian (lacto-ovo). sweet does not affect vegetarian.
+#   - "sin carne"/"ohne fleisch"/"veg." / "vegan" / "vegetarisch" are vegetarian
+#     even if a meat-sounding token appears (e.g. "Chili sin Carne").
+#
+# This table is deliberately conservative: when a name contains no recognized
+# animal keyword, the meal is reported vegetarian with contains == [].
+
+_VEG_OVERRIDE = (
+    "sin carne",
+    "ohne fleisch",
+    "vegetarisch",
+    "vegetarian",
+    "vegan",
+    "veg.",
+    "veggie",
+)
+
+_PORK_KW = (
+    "schwein", "kassler", "kasseler", "speck", "schinken", "bacon",
+    "wurst", "bratwurst", "salami", "leberkäs", "leberkas", "sülze", "suelze",
+    "eisbein",
+)
+_BEEF_KW = (
+    "rind", "beef", "hackfleisch", "hack", "frikadelle", "bulette", "boulette",
+    "tafelspitz", "roulade", "sauerbraten", "gyros", "döner", "doener", "kalb",
+)
+_POULTRY_KW = (
+    "huhn", "hühn", "huehn", "hähnchen", "haehnchen", "hahnchen", "geflügel",
+    "gefluegel", "pute", "puten", "truthahn", "chicken", "poulet",
+)
+_FISH_KW = (
+    "fisch", "lachs", "seelachs", "kabeljau", "thunfisch", "forelle", "scholle",
+    "hering", "garnel", "shrimp", "alaska", "pangasius",
+)
+# Egg compound words (matched as substrings). Standalone "Ei"/"Eier" is handled
+# separately via a word-boundary regex (see _EGG_WORD_RE) so that "…eintopf"
+# does not false-match and "mit Ei" / "Ei," is not missed.
+_EGG_KW = (
+    "eier", "omelett", "rührei", "ruehrei", "spiegelei", "eierkuchen", "eierspeise",
+)
+_EGG_WORD_RE = re.compile(r"\bei\b")
+_SWEET_KW = (
+    "süß", "suess", "pudding", "milchreis", "grießbrei", "griessbrei",
+    "apfelmus", "pfannkuchen", "kaiserschmarrn", "schmarrn", "kuchen", "waffel",
+    "quark", "dessert", "kompott", "vanille", "schokolad", "zimt", "palatschin",
+    "rote grütze", "gruetze", "kaltschale", "germknödel", "datsch",
+)
+
+
+def classify_meal(meal_name: str) -> dict[str, Any]:
+    """Best-effort heuristic tagging of a German dish name.
+
+    Returns a dict with keys:
+        vegetarian : bool  — True iff no pork/beef/poultry/fish keyword matched
+        contains   : list[str] — subset of ["pork","beef","poultry","fish","egg"]
+        sweet      : bool  — dessert / sweet dish
+
+    Pure function — no I/O. See the keyword table comment above for details.
+    This is heuristic and advisory; it does not replace the allergen list.
+    """
+    name = (meal_name or "").lower()
+    contains: list[str] = []
+
+    veg_override = any(tok in name for tok in _VEG_OVERRIDE)
+
+    def _has(keywords: tuple[str, ...]) -> bool:
+        return any(kw in name for kw in keywords)
+
+    pork = _has(_PORK_KW)
+    beef = _has(_BEEF_KW)
+    poultry = _has(_POULTRY_KW)
+    fish = _has(_FISH_KW)
+
+    # Ambiguous "gulasch"/"ragout": resolve by qualifier already-matched above.
+    # A bare "gulasch" (no other meat word) defaults to beef.
+    if "gulasch" in name and not (pork or poultry or fish):
+        beef = True
+    # "ragout" alone stays generic (no category) unless qualified by a matched
+    # meat keyword — nothing to do here; handled by the keyword sets above.
+
+    if veg_override:
+        # Explicit vegetarian/vegan declaration overrides meat-sounding tokens.
+        pork = beef = poultry = fish = False
+
+    if pork:
+        contains.append("pork")
+    if beef:
+        contains.append("beef")
+    if poultry:
+        contains.append("poultry")
+    if fish:
+        contains.append("fish")
+
+    # Egg: explicit egg compounds, standalone "Ei"/"Eier" (word-boundary), OR
+    # "frikassee" when no meat category fired.
+    egg = _has(_EGG_KW) or bool(_EGG_WORD_RE.search(name))
+    if "frikassee" in name and not (pork or beef or poultry or fish):
+        egg = True
+    if egg and "egg" not in contains:
+        contains.append("egg")
+
+    sweet = _has(_SWEET_KW)
+
+    vegetarian = not (pork or beef or poultry or fish)
+
+    return {"vegetarian": vegetarian, "contains": contains, "sweet": sweet}
+
+
+# ---------------------------------------------------------------------------
 # Helper: get numeric customer ID
 # ---------------------------------------------------------------------------
 
@@ -285,6 +431,159 @@ def _get_numeric_customer_id(
         f"Could not determine numeric customer ID for {customer_id}. "
         "Please check credentials."
     )
+
+
+# ---------------------------------------------------------------------------
+# Helper: SaveOrder payload + POST (shared by add_to_cart and bulk_add_to_cart)
+# ---------------------------------------------------------------------------
+
+
+def _build_save_order_payload(
+    numeric_customer_id: str,
+    serve_date: str,
+    menu_line_id: str,
+    menu_group_id: str,
+    quantity: int,
+) -> dict[str, Any]:
+    """Build the SaveOrder JSON payload (pure, no I/O)."""
+    return {
+        "mealOrderQuantity": {
+            "CustomerId": numeric_customer_id,
+            "ServeDate": serve_date,
+            "MenuGroupId": menu_group_id,
+            "MenuLineId": menu_line_id,
+            "QuantityInShoppingCart": quantity,
+            "ShoppingCartOrderType": "N",
+        }
+    }
+
+
+def _save_order(
+    client: httpx.Client,
+    customer_id: str,
+    password: str,
+    serve_date: str,
+    menu_line_id: str,
+    menu_group_id: str,
+    quantity: int,
+) -> httpx.Response:
+    """Resolve the numeric customer id and POST a SaveOrder request.
+
+    Shared by add_to_cart, remove_meal and bulk_add_to_cart. Returns the raw
+    httpx.Response (caller decides how to interpret it). The payload build is
+    delegated to the pure helper _build_save_order_payload so it is unit-testable
+    without HTTP.
+    """
+    serve_dt = datetime.strptime(serve_date, "%Y-%m-%d")
+    hdrs = _headers(customer_id, password)
+    numeric_customer_id = _get_numeric_customer_id(customer_id, password, serve_dt)
+    payload = _build_save_order_payload(
+        numeric_customer_id, serve_date, menu_line_id, menu_group_id, quantity
+    )
+    resp = client.post(
+        f"{BASE_URL}/Mealplan/SaveOrder",
+        headers=hdrs,
+        json=payload,
+    )
+    resp.raise_for_status()
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Helper: fetch + parse a single ISO-week weekplan (HTTP)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_weekplan(
+    customer_id: str, password: str, year: int, week: int
+) -> dict[str, Any]:
+    """GET one ISO-week weekplan page and return the parsed structure."""
+    client = _get_client()
+    hdrs = _headers(customer_id, password)
+    get_headers = {k: v for k, v in hdrs.items() if k != "Content-Type"}
+    resp = client.get(
+        f"{BASE_URL}/Mealplan/Weekplan",
+        params={"year": year, "week": week},
+        headers=get_headers,
+    )
+    resp.raise_for_status()
+    return _parse_weekplan(resp.text)
+
+
+# ---------------------------------------------------------------------------
+# Helper: week iteration over a date range (pure date math)
+# ---------------------------------------------------------------------------
+
+
+def _iso_weeks_in_range(from_date: str, to_date: str) -> list[tuple[int, int]]:
+    """Return the ordered, de-duplicated list of (iso_year, iso_week) tuples
+    that cover the inclusive [from_date, to_date] date range.
+
+    Pure — operates on YYYY-MM-DD strings, no I/O.
+    """
+    start = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end = datetime.strptime(to_date, "%Y-%m-%d").date()
+    if end < start:
+        start, end = end, start
+    weeks: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    cur = start
+    while cur <= end:
+        iso_year, iso_week, _ = cur.isocalendar()
+        key = (iso_year, iso_week)
+        if key not in seen:
+            seen.add(key)
+            weeks.append(key)
+        cur += timedelta(days=7)
+    # Make sure the final week (end's week) is included even if the 7-day stride
+    # overshot it.
+    end_key = (end.isocalendar()[0], end.isocalendar()[1])
+    if end_key not in seen:
+        weeks.append(end_key)
+    return weeks
+
+
+def _meal_to_json(item: dict[str, Any]) -> dict[str, Any]:
+    """Project a _parse_weekplan menu item into the get_menu/plan_order JSON shape."""
+    price = item.get("price")
+    return {
+        "line_label": item["line_label"],
+        "menu_line_id": item["menu_line_id"],
+        "menu_group_id": item["menu_group_id"],
+        "meal_name": item["meal_name"],
+        "price": price,
+        "max_quantity": item.get("max_quantity"),
+        "already_ordered": item.get("current_quantity", 0),
+        "orderable": not item.get("ordering_disabled", False),
+        "tags": classify_meal(item["meal_name"]),
+    }
+
+
+def _parse_price(price: Any) -> float | None:
+    """Parse a data-price string into a float euro amount, or None.
+
+    Handles "3,50", "3.50", "€3,50", "3,50 €" forms.
+    """
+    if price is None:
+        return None
+    s = str(price).replace("\xa0", " ").strip()
+    if not s:
+        return None
+    s = s.replace("€", "").replace("EUR", "").replace(" ", "").strip()
+    # Normalize the decimal separator. When both "," and "." appear, the
+    # rightmost is the decimal point and the other is a thousands separator
+    # (handles German "1.234,56" and US "1,234.56" without mangling either).
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -464,11 +763,17 @@ def get_cart_status(
     resp.raise_for_status()
 
     data = resp.json()
+    # NOTE: totalPriceInCart may read 0 (or be missing) until the order is
+    # confirmed. The authoritative per-meal price is the weekplan `data-price`
+    # value, which plan_order / get_menu surface. Treat the cart total here as
+    # best-effort and tolerate missing fields throughout.
     items = data.get("itemsInCart", 0)
     total = data.get("totalItemsInCart", 0)
-    price = data.get("totalPriceInCart", 0.0)
-    credits = data.get("creditBalance")
-    remaining = data.get("remainingCredits")
+    # Money fields may arrive as numbers or German-formatted strings — coerce
+    # defensively so formatting never crashes on a "10,50"-style value.
+    price = _parse_price(data.get("totalPriceInCart")) or 0.0
+    credits = _parse_price(data.get("creditBalance"))
+    remaining = _parse_price(data.get("remainingCredits"))
 
     pname = profile or next(iter(_profiles), "?")
     lines = [f"# Shopping Cart Status — {pname}\n"]
@@ -479,6 +784,9 @@ def get_cart_status(
         lines.append(f"- Credit balance: €{credits:.2f}")
     if remaining is not None:
         lines.append(f"- Remaining credits: €{remaining:.2f}")
+    # Show projected balance after the cart is paid for, when credit is known.
+    if credits is not None:
+        lines.append(f"- Balance after cart: €{(credits - price):.2f}")
 
     return "\n".join(lines)
 
@@ -517,25 +825,16 @@ def add_to_cart(
 
     client = _get_client()
     hdrs = _headers(customer_id, password)
-    numeric_customer_id = _get_numeric_customer_id(customer_id, password, serve_dt)
 
-    payload = {
-        "mealOrderQuantity": {
-            "CustomerId": numeric_customer_id,
-            "ServeDate": serve_date,
-            "MenuGroupId": menu_group_id,
-            "MenuLineId": menu_line_id,
-            "QuantityInShoppingCart": quantity,
-            "ShoppingCartOrderType": "N",
-        }
-    }
-
-    resp = client.post(
-        f"{BASE_URL}/Mealplan/SaveOrder",
-        headers=hdrs,
-        json=payload,
+    _save_order(
+        client,
+        customer_id,
+        password,
+        serve_date,
+        menu_line_id,
+        menu_group_id,
+        quantity,
     )
-    resp.raise_for_status()
 
     # Verify by checking cart
     cart_resp = client.post(
@@ -573,28 +872,17 @@ def remove_meal(
         Confirmation that the meal was removed from cart.
     """
     customer_id, password = _resolve_profile(profile)
-    serve_dt = datetime.strptime(serve_date, "%Y-%m-%d")
     client = _get_client()
-    hdrs = _headers(customer_id, password)
-    numeric_customer_id = _get_numeric_customer_id(customer_id, password, serve_dt)
 
-    payload = {
-        "mealOrderQuantity": {
-            "CustomerId": numeric_customer_id,
-            "ServeDate": serve_date,
-            "MenuGroupId": menu_group_id,
-            "MenuLineId": menu_line_id,
-            "QuantityInShoppingCart": 0,
-            "ShoppingCartOrderType": "N",
-        }
-    }
-
-    resp = client.post(
-        f"{BASE_URL}/Mealplan/SaveOrder",
-        headers=hdrs,
-        json=payload,
+    _save_order(
+        client,
+        customer_id,
+        password,
+        serve_date,
+        menu_line_id,
+        menu_group_id,
+        0,
     )
-    resp.raise_for_status()
 
     pname = profile or next(iter(_profiles), "?")
     return f"Removed meal (line {menu_line_id}) for {serve_date} from {pname}'s cart."
@@ -648,6 +936,458 @@ def confirm_order(
         return f"Order confirmed for {pname}! {items} item(s) ordered. Server: {message}"
     else:
         return f"Order failed for {pname}. Server: {message}"
+
+
+# ---------------------------------------------------------------------------
+# Pure planning logic (importable, no I/O) — used by plan_order
+# ---------------------------------------------------------------------------
+
+
+def _plan_lines(
+    items: list[dict[str, Any]],
+    by_date: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Compute a dry-run plan from requested items against parsed weekplan data.
+
+    Pure function — no HTTP. `by_date` is the merged {serve_date: [menu_item,...]}
+    mapping (as produced by _parse_weekplan, possibly across several weeks).
+
+    Each requested item: {serve_date, menu_line_id, menu_group_id?(default "2")}.
+
+    conflict ∈ {None, "no_school_day", "unknown_line", "not_orderable",
+                "already_ordered"} with that precedence.
+
+    Returns {lines, order_total, counts}.
+    """
+    lines: list[dict[str, Any]] = []
+    order_total = 0.0
+    orderable_count = 0
+    conflict_count = 0
+
+    for req in items:
+        serve_date = req.get("serve_date", "")
+        menu_line_id = str(req.get("menu_line_id", ""))
+        menu_group_id = str(req.get("menu_group_id", "2") or "2")
+
+        conflict: str | None = None
+        line_label = None
+        meal_name = None
+        price = None
+        already_ordered = 0
+        orderable = False
+        tags: dict[str, Any] | None = None
+
+        day_items = by_date.get(serve_date)
+        if day_items is None:
+            conflict = "no_school_day"
+        else:
+            match = None
+            for it in day_items:
+                if str(it["menu_line_id"]) == menu_line_id and (
+                    str(it["menu_group_id"]) == menu_group_id
+                ):
+                    match = it
+                    break
+            # Fall back to line-only match if group didn't line up.
+            if match is None:
+                for it in day_items:
+                    if str(it["menu_line_id"]) == menu_line_id:
+                        match = it
+                        break
+            if match is None:
+                conflict = "unknown_line"
+            else:
+                line_label = match["line_label"]
+                meal_name = match["meal_name"]
+                price = match.get("price")
+                already_ordered = match.get("current_quantity", 0)
+                orderable = not match.get("ordering_disabled", False)
+                tags = classify_meal(meal_name)
+                if match.get("ordering_disabled", False):
+                    conflict = "not_orderable"
+                elif already_ordered > 0:
+                    conflict = "already_ordered"
+
+        line = {
+            "serve_date": serve_date,
+            "menu_line_id": menu_line_id,
+            "menu_group_id": menu_group_id,
+            "line_label": line_label,
+            "meal_name": meal_name,
+            "price": price,
+            "already_ordered": already_ordered,
+            "orderable": orderable,
+            "tags": tags,
+            "conflict": conflict,
+        }
+        lines.append(line)
+
+        if conflict is None and orderable:
+            orderable_count += 1
+            parsed = _parse_price(price)
+            if parsed is not None:
+                order_total += parsed
+        else:
+            conflict_count += 1
+
+    return {
+        "lines": lines,
+        "order_total": round(order_total, 2),
+        "counts": {"orderable": orderable_count, "conflicts": conflict_count},
+    }
+
+
+# ---------------------------------------------------------------------------
+# New tool: get_menu (date-range menu with tags)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_menu(
+    profile: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    as_json: bool = False,
+) -> str | list[dict[str, Any]]:
+    """Get the menu for an arbitrary date range, with dietary tags per meal.
+
+    Fetches every ISO week that overlaps [from_date, to_date] (deduped/cached
+    within the call), then filters meals down to the requested range.
+
+    Args:
+        profile: Profile name (e.g. "child1"). Optional if only one profile is configured.
+        from_date: Start date YYYY-MM-DD (defaults to today).
+        to_date: End date YYYY-MM-DD (defaults to from_date).
+        as_json: If True, return a structured JSON list instead of markdown.
+
+    Returns:
+        Markdown (as_json=False) listing meals per day with dietary tags, or a
+        JSON list (as_json=True) of {date, weekday, meals:[...]} where each meal
+        carries line_label, ids, meal_name, price, max_quantity, already_ordered,
+        orderable and tags (classify_meal output).
+    """
+    customer_id, password = _resolve_profile(profile)
+
+    if not from_date:
+        from_date = datetime.now().strftime("%Y-%m-%d")
+    if not to_date:
+        to_date = from_date
+
+    start = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end = datetime.strptime(to_date, "%Y-%m-%d").date()
+    if end < start:
+        start, end = end, start
+
+    # Fetch + merge all overlapping weeks (cache per (year, week) within the call).
+    merged_by_date: dict[str, list[dict[str, Any]]] = {}
+    week_cache: dict[tuple[int, int], dict[str, Any]] = {}
+    for year, week in _iso_weeks_in_range(from_date, to_date):
+        if (year, week) not in week_cache:
+            week_cache[(year, week)] = _fetch_weekplan(customer_id, password, year, week)
+        for d, day_items in week_cache[(year, week)]["by_date"].items():
+            merged_by_date.setdefault(d, []).extend(day_items)
+
+    # Filter to range.
+    result: list[dict[str, Any]] = []
+    for date in sorted(merged_by_date.keys()):
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+        if d < start or d > end:
+            continue
+        meals = [
+            _meal_to_json(it)
+            for it in sorted(merged_by_date[date], key=lambda x: x["menu_line_id"])
+        ]
+        result.append(
+            {
+                "date": date,
+                "weekday": datetime.strptime(date, "%Y-%m-%d").strftime("%A"),
+                "meals": meals,
+            }
+        )
+
+    if as_json:
+        return result
+
+    pname = profile or next(iter(_profiles), "?")
+    lines = [f"# Menu for {pname} — {from_date} to {to_date}\n"]
+    if not result:
+        lines.append("_No meals found in this range._")
+        return "\n".join(lines)
+    for day in result:
+        dt = datetime.strptime(day["date"], "%Y-%m-%d")
+        lines.append(f"\n## {dt.strftime('%A, %B %d')} ({day['date']})")
+        for meal in day["meals"]:
+            status = ""
+            if not meal["orderable"]:
+                status = " [EXPIRED]"
+            elif meal["already_ordered"] > 0:
+                status = f" [ORDERED: {meal['already_ordered']}]"
+            price_str = f" — {meal['price']}" if meal.get("price") else ""
+            max_str = (
+                f" (max: {meal['max_quantity']})" if meal.get("max_quantity") else ""
+            )
+            tags = meal["tags"]
+            tag_bits: list[str] = []
+            if tags["vegetarian"]:
+                tag_bits.append("vegetarian")
+            if tags["contains"]:
+                tag_bits.append("contains: " + ", ".join(tags["contains"]))
+            if tags["sweet"]:
+                tag_bits.append("sweet")
+            tag_str = f"  _[{'; '.join(tag_bits)}]_" if tag_bits else ""
+            lines.append(
+                f"  - **{meal['line_label']}**: {meal['meal_name']}"
+                f"{price_str}{max_str}{status}{tag_str}"
+            )
+            lines.append(
+                f"    IDs: menu_group={meal['menu_group_id']}, "
+                f"menu_line={meal['menu_line_id']}"
+            )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# New tool: plan_order (DRY RUN — preview cost + conflicts, no mutation)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def plan_order(
+    profile: str = "",
+    items: list[dict[str, Any]] | None = None,
+    as_json: bool = False,
+) -> str | dict[str, Any]:
+    """DRY RUN: preview a multi-meal order — cost and conflicts — without mutating.
+
+    Only GETs weekplans; never touches the cart. Use this before bulk_add_to_cart.
+
+    Args:
+        profile: Profile name (e.g. "child1"). Optional if only one profile is configured.
+        items: list of {serve_date, menu_line_id, menu_group_id?(default "2")}.
+        as_json: If True, return the structured dict instead of markdown.
+
+    Returns:
+        Per-line plan with {serve_date, menu_line_id, line_label, meal_name,
+        price, already_ordered, orderable, tags, conflict}, plus order_total
+        (sum of prices for lines with conflict None and orderable True) and
+        counts {orderable, conflicts}. conflict is one of None, "no_school_day",
+        "unknown_line", "not_orderable", "already_ordered".
+    """
+    customer_id, password = _resolve_profile(profile)
+    items = items or []
+
+    if not items:
+        plan = {"lines": [], "order_total": 0.0, "counts": {"orderable": 0, "conflicts": 0}}
+    else:
+        # Determine the date span to fetch.
+        dates = [str(it.get("serve_date", "")) for it in items if it.get("serve_date")]
+        valid_dates = [d for d in dates if re.match(r"\d{4}-\d{2}-\d{2}$", d)]
+        merged_by_date: dict[str, list[dict[str, Any]]] = {}
+        if valid_dates:
+            from_date = min(valid_dates)
+            to_date = max(valid_dates)
+            week_cache: dict[tuple[int, int], dict[str, Any]] = {}
+            for year, week in _iso_weeks_in_range(from_date, to_date):
+                if (year, week) not in week_cache:
+                    week_cache[(year, week)] = _fetch_weekplan(
+                        customer_id, password, year, week
+                    )
+                for d, day_items in week_cache[(year, week)]["by_date"].items():
+                    merged_by_date.setdefault(d, []).extend(day_items)
+        plan = _plan_lines(items, merged_by_date)
+
+    if as_json:
+        return plan
+
+    pname = profile or next(iter(_profiles), "?")
+    out = [f"# Order plan (DRY RUN) — {pname}\n"]
+    for line in plan["lines"]:
+        if line["conflict"] is None:
+            mark = "✅"
+        elif line["conflict"] == "already_ordered":
+            mark = "☑️"
+        else:
+            mark = "⚠️"
+        meal = line["meal_name"] or "(not found)"
+        price = f" — {line['price']}" if line.get("price") else ""
+        conf = f"  [{line['conflict']}]" if line["conflict"] else ""
+        label = line["line_label"] or f"line {line['menu_line_id']}"
+        out.append(
+            f"- {mark} **{line['serve_date']}** {label}: {meal}{price}{conf}"
+        )
+    out.append("")
+    out.append(f"**Order total (orderable lines): €{plan['order_total']:.2f}**")
+    out.append(
+        f"Orderable: {plan['counts']['orderable']} · "
+        f"Conflicts: {plan['counts']['conflicts']}"
+    )
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# New tool: bulk_add_to_cart (mutating — adds many meals at once)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def bulk_add_to_cart(
+    profile: str = "",
+    items: list[dict[str, Any]] | None = None,
+) -> str:
+    """Add multiple meals to the cart in one call. Does NOT finalize the order.
+
+    Each item is validated for the >=1-day-advance rule; items that fail are
+    SKIPPED and reported (the rest still proceed). Call confirm_order afterwards.
+
+    Args:
+        profile: Profile name (e.g. "child1"). Optional if only one profile is configured.
+        items: list of {serve_date, menu_line_id, menu_group_id?(default "2"),
+               quantity?(default 1)}.
+
+    Returns:
+        Per-line ok/skip/fail summary plus the final cart total.
+    """
+    customer_id, password = _resolve_profile(profile)
+    items = items or []
+    client = _get_client()
+    hdrs = _headers(customer_id, password)
+
+    tomorrow = datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) + timedelta(days=1)
+
+    results: list[dict[str, Any]] = []
+    for it in items:
+        serve_date = str(it.get("serve_date", ""))
+        menu_line_id = str(it.get("menu_line_id", ""))
+        menu_group_id = str(it.get("menu_group_id", "2") or "2")
+
+        # Parse quantity inside the guard: a bad or <1 value skips THIS item,
+        # it does not crash the whole batch (the tool's documented contract).
+        try:
+            quantity = int(it.get("quantity", 1))
+        except (TypeError, ValueError):
+            results.append(
+                {
+                    "serve_date": serve_date,
+                    "menu_line_id": menu_line_id,
+                    "status": "skip",
+                    "reason": "invalid quantity (must be an integer)",
+                }
+            )
+            continue
+        if quantity < 1:
+            results.append(
+                {
+                    "serve_date": serve_date,
+                    "menu_line_id": menu_line_id,
+                    "status": "skip",
+                    "reason": "quantity must be >= 1",
+                }
+            )
+            continue
+
+        # >=1-day-advance validation — skip (don't abort) on failure.
+        try:
+            serve_dt = datetime.strptime(serve_date, "%Y-%m-%d")
+        except ValueError:
+            results.append(
+                {
+                    "serve_date": serve_date,
+                    "menu_line_id": menu_line_id,
+                    "status": "skip",
+                    "reason": "invalid date format (expected YYYY-MM-DD)",
+                }
+            )
+            continue
+
+        if serve_dt < tomorrow:
+            results.append(
+                {
+                    "serve_date": serve_date,
+                    "menu_line_id": menu_line_id,
+                    "status": "skip",
+                    "reason": "must be ordered at least 1 day in advance",
+                }
+            )
+            continue
+
+        try:
+            _save_order(
+                client,
+                customer_id,
+                password,
+                serve_date,
+                menu_line_id,
+                menu_group_id,
+                quantity,
+            )
+            results.append(
+                {
+                    "serve_date": serve_date,
+                    "menu_line_id": menu_line_id,
+                    "status": "ok",
+                    "quantity": quantity,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — report per-line, keep going
+            results.append(
+                {
+                    "serve_date": serve_date,
+                    "menu_line_id": menu_line_id,
+                    "status": "fail",
+                    "reason": str(exc),
+                }
+            )
+
+    # Final cart total via UpdateBalanceAndCart (tolerate missing fields).
+    cart_total = "?"
+    cart_price = None
+    try:
+        cart_resp = client.post(
+            f"{BASE_URL}/Mealplan/UpdateBalanceAndCart",
+            headers=hdrs,
+            json={},
+        )
+        if cart_resp.status_code == 200:
+            cart_data = cart_resp.json()
+            cart_total = cart_data.get("totalItemsInCart", "?")
+            cart_price = cart_data.get("totalPriceInCart")
+    except Exception:  # noqa: BLE001
+        pass
+
+    pname = profile or next(iter(_profiles), "?")
+    n_ok = sum(1 for r in results if r["status"] == "ok")
+    n_skip = sum(1 for r in results if r["status"] == "skip")
+    n_fail = sum(1 for r in results if r["status"] == "fail")
+
+    lines = [f"# Bulk add to cart — {pname}\n"]
+    for r in results:
+        if r["status"] == "ok":
+            lines.append(
+                f"- ✅ {r['serve_date']} line {r['menu_line_id']} "
+                f"(x{r.get('quantity', 1)}) added"
+            )
+        elif r["status"] == "skip":
+            lines.append(
+                f"- ⏭️ {r['serve_date']} line {r['menu_line_id']} "
+                f"SKIPPED — {r['reason']}"
+            )
+        else:
+            lines.append(
+                f"- ❌ {r['serve_date']} line {r['menu_line_id']} "
+                f"FAILED — {r['reason']}"
+            )
+    lines.append("")
+    lines.append(f"**{n_ok} added · {n_skip} skipped · {n_fail} failed**")
+    if cart_price is not None:
+        lines.append(
+            f"Cart now has {cart_total} item(s), total €{float(cart_price):.2f}."
+        )
+    else:
+        lines.append(f"Cart now has {cart_total} item(s).")
+    lines.append("⚠️ NOT YET ORDERED — call confirm_order to finalize.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
