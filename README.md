@@ -66,7 +66,7 @@ Add to your Claude Desktop MCP config (`~/.claude/settings.json` or a project-le
 
 | Tool | Description |
 |------|-------------|
-| `list_profiles` | List configured profiles (children) |
+| `list_profiles` | List configured profiles **with the real account holder name**, warning on any label/holder mismatch |
 | `get_weekly_menu` | Browse meals for a given calendar week |
 | `get_menu` | Browse meals for an arbitrary date range, with dietary tags per meal (markdown or JSON) |
 | `plan_order` | **Dry run** — preview total cost + per-line conflicts for a multi-meal order, **without mutating** |
@@ -75,7 +75,8 @@ Add to your Claude Desktop MCP config (`~/.claude/settings.json` or a project-le
 | `add_to_cart` | Add a single meal to the cart (does **not** finalize the order) |
 | `bulk_add_to_cart` | Add **many** meals to the cart at once; per-item validation, skip+report on failure |
 | `confirm_order` | Finalize and submit all items in the cart |
-| `remove_meal` | Remove a meal from the cart |
+| `remove_meal` | Stage a cart quantity of 0 (does **not** cancel a confirmed order on its own) |
+| `cancel_order` | Cancel confirmed orders: stage + confirm + verify the offsetting `-1` rows |
 
 ### Ordering flow
 

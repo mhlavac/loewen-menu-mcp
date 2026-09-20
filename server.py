@@ -11,6 +11,7 @@ Credentials are configured via the PROFILES environment variable:
 import base64
 import os
 import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -240,10 +241,12 @@ def _parse_order_history(html: str) -> list[dict[str, str]]:
 #
 #   pork    : schwein, kassler, kassel, speck, schinken, bacon, wurst, bratwurst,
 #             salami, leberkäs, leberkas, sülze, suelze, eisbein, kasseler,
-#             schweine, gulasch (NOTE: ambiguous — see below)
+#             schweine, gulasch (NOTE: ambiguous — see below),
+#             würst, wuerst (NOTE: "wurst" does NOT substring-match "Würstchen",
+#             so both umlaut spellings must be listed separately)
 #   beef     : rind, beef, gulasch, hack, hackfleisch, frikadelle, bulette,
 #             boulette, tafelspitz, roulade, sauerbraten, gyros, döner, doener,
-#             kalb, ragout (ambiguous — see below)
+#             kalb, klops (Königsberger Klopse), ragout (ambiguous — see below)
 #   poultry  : huhn, hühn, huehn, hähnchen, haehnchen, hahnchen, geflügel,
 #             gefluegel, pute, puten, truthahn, chicken, poulet
 #   fish     : fisch, lachs, seelachs, kabeljau, thunfisch, forelle, scholle,
@@ -269,6 +272,13 @@ def _parse_order_history(html: str) -> list[dict[str, str]]:
 #     break vegetarian (lacto-ovo). sweet does not affect vegetarian.
 #   - "sin carne"/"ohne fleisch"/"veg." / "vegan" / "vegetarisch" are vegetarian
 #     even if a meat-sounding token appears (e.g. "Chili sin Carne").
+#   - _VEG_COMPOUND_RE rescues vegetable/pulse compounds that merely LOOK meaty:
+#     (gemüse|linsen|kichererbsen|soja|tofu|quinoa|hirse|grünkern|dinkel) directly
+#     compounded with (frikadelle|bulette|bratling|klops|schnitzel|gulasch|wurst|
+#     bällchen|steak) -> vegetarian. So "Gemüsefrikadelle" and "Sojagulasch" are
+#     vegetarian while "Geflügelbulette" is not. NOTE: "käse" is deliberately NOT
+#     a prefix in that group — "Käsewurst" is a cheese-stuffed MEAT sausage, and
+#     including it would override the correct wurst->pork match.
 #
 # This table is deliberately conservative: when a name contains no recognized
 # animal keyword, the meal is reported vegetarian with contains == [].
@@ -285,12 +295,29 @@ _VEG_OVERRIDE = (
 
 _PORK_KW = (
     "schwein", "kassler", "kasseler", "speck", "schinken", "bacon",
-    "wurst", "bratwurst", "salami", "leberkäs", "leberkas", "sülze", "suelze",
-    "eisbein",
+    # "würst"/"wuerst" are NOT covered by "wurst": the umlaut makes
+    # "Würstchen" a different string, which silently passed as vegetarian.
+    "wurst", "würst", "wuerst", "bratwurst", "salami", "leberkäs", "leberkas",
+    "sülze", "suelze", "eisbein",
 )
 _BEEF_KW = (
     "rind", "beef", "hackfleisch", "hack", "frikadelle", "bulette", "boulette",
     "tafelspitz", "roulade", "sauerbraten", "gyros", "döner", "doener", "kalb",
+    # Königsberger Klopse — meatballs, previously unmatched entirely.
+    "klops",
+)
+
+# Vegetable/pulse compounds that LOOK meaty but are not: "Gemüsefrikadelle",
+# "Gemüsebulette", "Linsenbratling", "Sojagulasch". Matched as a unit so that
+# the plain meat keyword inside them does not fire.
+_VEG_COMPOUND_RE = re.compile(
+    # NB: "käse" is deliberately NOT a prefix here — Käsewurst/Käsewürstchen
+    # is a cheese-stuffed MEAT sausage, and listing it would override the
+    # correct wurst->pork match and report the dish as vegetarian.
+    r"(gem(?:ü|ue)se|linsen|kichererbsen|soja|tofu|quinoa|hirse|"
+    r"gr(?:ü|ue)nkern|dinkel)-?"
+    r"(frikadelle|bulette|boulette|bratling|klops|schnitzel|gulasch|"
+    r"w(?:ü|u)rst|b(?:ä|ae)llchen|steak)"
 )
 _POULTRY_KW = (
     "huhn", "hühn", "huehn", "hähnchen", "haehnchen", "hahnchen", "geflügel",
@@ -307,6 +334,22 @@ _EGG_KW = (
     "eier", "omelett", "rührei", "ruehrei", "spiegelei", "eierkuchen", "eierspeise",
 )
 _EGG_WORD_RE = re.compile(r"\bei\b")
+
+# Weekplan rows that are not meals at all. IBS5 renders holiday/closure markers
+# ("FERIEN", "FERIENSTART!!!") in the same slot as a dish name, with an ordinary
+# quantity input, so without this they come back as perfectly orderable meals.
+_NON_MEAL_MARKERS = (
+    "ferien", "feiertag", "schulfrei", "kein angebot", "keine ausgabe",
+    "geschlossen", "kein essen",
+)
+
+
+def _is_non_meal(meal_name: str) -> bool:
+    """True if a weekplan row is a placeholder/marker rather than a dish."""
+    name = (meal_name or "").strip().lower()
+    if not name:
+        return True
+    return any(marker in name for marker in _NON_MEAL_MARKERS)
 _SWEET_KW = (
     "süß", "suess", "pudding", "milchreis", "grießbrei", "griessbrei",
     "apfelmus", "pfannkuchen", "kaiserschmarrn", "schmarrn", "kuchen", "waffel",
@@ -329,7 +372,9 @@ def classify_meal(meal_name: str) -> dict[str, Any]:
     name = (meal_name or "").lower()
     contains: list[str] = []
 
-    veg_override = any(tok in name for tok in _VEG_OVERRIDE)
+    veg_override = any(tok in name for tok in _VEG_OVERRIDE) or bool(
+        _VEG_COMPOUND_RE.search(name)
+    )
 
     def _has(keywords: tuple[str, ...]) -> bool:
         return any(kw in name for kw in keywords)
@@ -381,6 +426,159 @@ def classify_meal(meal_name: str) -> dict[str, Any]:
 # Cache to avoid repeated lookups
 _customer_id_cache: dict[str, str] = {}
 
+# Account identity (holder / school / email), scraped from the same weekplan
+# page as the numeric id and keyed by login customer id. IBS5 offers no other
+# way to learn WHOSE account a credential pair opens, so this is what lets the
+# tools catch a PROFILES entry that points at the wrong child.
+_account_cache: dict[str, dict[str, str]] = {}
+
+
+def _clean_field(value: Any) -> str:
+    """Trim and collapse internal whitespace runs.
+
+    IBS5 pads name1 to a fixed width ("Surname, First      Wd-1234-"), which
+    would otherwise be echoed verbatim into every tool's output.
+    """
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _parse_login_identity(data: dict[str, Any]) -> dict[str, str]:
+    """Project a /Login/Login JSON response into the identity shape. Pure."""
+    return {
+        "holder": _clean_field(data.get("name1")),
+        "school": _clean_field(data.get("institutionName1")),
+        "email": _clean_field(data.get("email")),
+    }
+
+
+def _fetch_account_identity(customer_id: str, password: str) -> dict[str, str]:
+    """Resolve the account holder via IBS5's own login endpoint.
+
+    No *server-rendered* IBS5 page carries the holder name: the web client
+    learns it from POST /Login/Login, stashes name1/institutionName1/email in
+    sessionStorage and builds the sidebar from there with JavaScript. An httpx
+    client executes no JS, so scraping the fetched HTML cannot recover it --
+    which is why _parse_account_info is only a fallback, kept in case IBS5
+    starts rendering that block server-side again. This mirrors the browser's
+    own request: identifierType/secretType 0 means "customer number + password".
+    """
+    client = _get_client()
+    resp = client.post(
+        f"{BASE_URL}/Login/Login",
+        data={
+            "identifierValue": customer_id,
+            "secretValue": password,
+            "identifierType": "0",
+            "secretType": "0",
+        },
+        headers={
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0 (compatible; LoewendMenuMCP/1.0)",
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        },
+    )
+    resp.raise_for_status()
+    return _parse_login_identity(resp.json())
+
+
+def _fetch_identity_page(
+    customer_id: str, password: str, reference_date: datetime | None = None
+) -> str:
+    """GET a weekplan page and refresh the account-identity cache from it.
+
+    One page carries BOTH the hidden numeric #userId and the account-holder
+    block, so a single request serves both needs. Keeping the fetch here (and
+    not inside _get_numeric_customer_id) is what stops an already-cached
+    numeric id from permanently starving the account cache — the bug that made
+    identity resolve to UNVERIFIED whenever any other tool ran first.
+    """
+    if reference_date is None:
+        reference_date = datetime.now()
+
+    client = _get_client()
+    hdrs = _headers(customer_id, password)
+    get_headers = {k: v for k, v in hdrs.items() if k != "Content-Type"}
+    resp = client.get(
+        f"{BASE_URL}/Mealplan/Weekplan",
+        params={
+            "year": reference_date.year,
+            "week": reference_date.isocalendar()[1],
+        },
+        headers=get_headers,
+    )
+    resp.raise_for_status()
+
+    info = _parse_account_info(resp.text)
+    if info.get("holder"):
+        _account_cache[customer_id] = info
+    return resp.text
+
+
+# Holder labels have a very distinctive shape: "Surname, Firstname Bldg-1234-".
+# Matching that directly means identity still resolves if IBS5 renames its CSS
+# classes or ships different markup to an API client than to the browser.
+_HOLDER_RE = re.compile(
+    r"([A-ZÄÖÜ][^\s<>,]{1,40},\s*[A-ZÄÖÜ][^\s<>]{1,40}\s+[A-Za-zÄÖÜäöü]{1,4}-\d{1,8}-)"
+)
+
+
+def _parse_account_info(html: str) -> dict[str, str]:
+    """Extract the logged-in account's identity from any IBS5 page.
+
+    The left navigation block carries the Einrichtung, the account holder's
+    name with its building label (e.g. "Surname, First Wd-1234-") and the
+    contact mail. Falls back to a shape-based regex over the raw HTML when the
+    expected classes are absent. Pure: takes HTML, returns a dict, no I/O.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    def _text(selector: str) -> str:
+        el = soup.select_one(selector)
+        return el.get_text(strip=True) if el else ""
+
+    holder = _text(".navigation-name")
+    if not holder:
+        # Partial class match, in case the class was renamed or suffixed.
+        el = soup.select_one('[class*="navigation-name"]')
+        holder = el.get_text(strip=True) if el else ""
+    if not holder:
+        match = _HOLDER_RE.search(soup.get_text(" ", strip=True)) or _HOLDER_RE.search(html)
+        holder = match.group(1).strip() if match else ""
+
+    return {
+        "holder": holder,
+        "school": _text(".navigation-lsk"),
+        "email": _text(".navigation-mail"),
+    }
+
+
+def _normalize_name(value: str) -> str:
+    """Lowercase and strip diacritics, for loose profile/holder comparison."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _profile_matches_holder(profile_name: str, holder: str) -> bool:
+    """True if the profile label names one of the holder's name tokens.
+
+    Compares WHOLE tokens, not substrings. Plain containment silently passed
+    real sibling/classmate pairs — "emma" is a substring of "Gemma", "ben" of
+    "Ruben", "lena" of "Milena" — so a profile mislabelled onto the wrong
+    child produced no warning at all, which is the exact failure this check
+    exists to catch. Erring toward a false warning is fine; a false PASS is not.
+    """
+    if not profile_name or not holder:
+        return True  # nothing to contradict
+    needle = _normalize_name(profile_name).strip()
+    if not needle:
+        return True
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(_normalize_name(holder)) if t]
+    return needle in tokens
+
 
 def _get_numeric_customer_id(
     customer_id: str, password: str, reference_date: datetime | None = None
@@ -394,23 +592,8 @@ def _get_numeric_customer_id(
     if customer_id in _customer_id_cache:
         return _customer_id_cache[customer_id]
 
-    if reference_date is None:
-        reference_date = datetime.now()
-
-    week = reference_date.isocalendar()[1]
-    year = reference_date.year
-
-    client = _get_client()
-    hdrs = _headers(customer_id, password)
-    get_headers = {k: v for k, v in hdrs.items() if k != "Content-Type"}
-    resp = client.get(
-        f"{BASE_URL}/Mealplan/Weekplan",
-        params={"year": year, "week": week},
-        headers=get_headers,
-    )
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "lxml")
+    html = _fetch_identity_page(customer_id, password, reference_date)
+    soup = BeautifulSoup(html, "lxml")
 
     # Primary: hidden input with id="userId"
     user_id_input = soup.select_one('input#userId')
@@ -421,7 +604,7 @@ def _get_numeric_customer_id(
             return val
 
     # Fallback: search for CustomerId pattern in page source
-    match = re.search(r'"CustomerId"\s*:\s*"?(\d+)"?', resp.text)
+    match = re.search(r'"CustomerId"\s*:\s*"?(\d+)"?', html)
     if match:
         val = match.group(1)
         _customer_id_cache[customer_id] = val
@@ -431,6 +614,56 @@ def _get_numeric_customer_id(
         f"Could not determine numeric customer ID for {customer_id}. "
         "Please check credentials."
     )
+
+
+def _get_account_info(customer_id: str, password: str) -> dict[str, str]:
+    """Return {holder, school, email} for a login, fetching and caching if needed.
+
+    Never raises: identity is advisory, so a network or credential failure
+    degrades to an empty dict rather than breaking the calling tool.
+    """
+    if customer_id in _account_cache:
+        return _account_cache[customer_id]
+
+    # Primary: the login endpoint — the only place IBS5 returns the holder.
+    err = "login returned no name1 field"
+    try:
+        info = _fetch_account_identity(customer_id, password)
+    except Exception as exc:  # noqa: BLE001 — advisory only, never fatal
+        info = {}
+        err = f"login request failed ({type(exc).__name__}: {exc})"
+    if info.get("holder"):
+        _account_cache[customer_id] = info
+        return info
+
+    # Fallback: scrape a page, in case the login contract changes back.
+    try:
+        _fetch_identity_page(customer_id, password)
+    except Exception:  # noqa: BLE001
+        pass
+    if customer_id in _account_cache:
+        return _account_cache[customer_id]
+    return {"_error": err}
+
+
+def _who(profile: str) -> str:
+    """Label a profile by BOTH its config name and the real account holder.
+
+    Every mutating tool reports through this, so an order placed on the wrong
+    child's account is visible in the tool output instead of silent.
+    """
+    pname = profile or next(iter(_profiles), "?")
+    try:
+        customer_id, password = _resolve_profile(profile)
+    except Exception:  # noqa: BLE001
+        return pname
+    info = _get_account_info(customer_id, password)
+    holder = info.get("holder")
+    if not holder:
+        return f"{pname} ({customer_id}, holder UNVERIFIED)"
+    if _profile_matches_holder(pname, holder):
+        return f"{pname} ({holder})"
+    return f"{pname} ({holder}) ⚠️ NAME MISMATCH"
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +779,7 @@ def _iso_weeks_in_range(from_date: str, to_date: str) -> list[tuple[int, int]]:
 def _meal_to_json(item: dict[str, Any]) -> dict[str, Any]:
     """Project a _parse_weekplan menu item into the get_menu/plan_order JSON shape."""
     price = item.get("price")
+    non_meal = _is_non_meal(item["meal_name"])
     return {
         "line_label": item["line_label"],
         "menu_line_id": item["menu_line_id"],
@@ -554,7 +788,9 @@ def _meal_to_json(item: dict[str, Any]) -> dict[str, Any]:
         "price": price,
         "max_quantity": item.get("max_quantity"),
         "already_ordered": item.get("current_quantity", 0),
-        "orderable": not item.get("ordering_disabled", False),
+        # A holiday/closure marker is never orderable, whatever the widget says.
+        "orderable": not item.get("ordering_disabled", False) and not non_meal,
+        "non_meal": non_meal,
         "tags": classify_meal(item["meal_name"]),
     }
 
@@ -600,8 +836,12 @@ mcp = FastMCP(
         "add_to_cart to add items to the cart, "
         "get_cart_status to check the shopping cart, "
         "confirm_order to finalize and submit the cart, and "
-        "remove_meal to cancel an order. "
-        "All tools take a 'profile' parameter (e.g. 'child1') to identify the child."
+        "cancel_order to cancel already-confirmed orders (remove_meal only "
+        "stages a cart quantity of 0 and does NOT cancel on its own). "
+        "All tools take a 'profile' parameter (e.g. 'child1') to identify the child. "
+        "ALWAYS run list_profiles first and check the account holder name it "
+        "reports: the customer id in PROFILES is unverifiable on its own, and a "
+        "mislabelled profile silently books meals for the wrong child."
     ),
 )
 
@@ -620,9 +860,41 @@ def list_profiles() -> str:
         )
 
     lines = ["# Configured Profiles\n"]
+    mismatches = 0
+    unverified = 0
     for name in sorted(_profiles):
         cid = _profiles[name]["customer_id"]
-        lines.append(f"- **{name}** (account: {cid})")
+        info = _get_account_info(cid, _profiles[name]["password"])
+        holder = info.get("holder", "")
+        school = info.get("school", "")
+        if not holder:
+            unverified += 1
+            reason = info.get("_error", "unknown reason")
+            lines.append(
+                f"- **{name}** (account: {cid}) — ⚠️ identity UNVERIFIED: {reason}"
+            )
+            continue
+        suffix = f" · {school}" if school else ""
+        lines.append(f"- **{name}** (account: {cid}) → **{holder}**{suffix}")
+        if not _profile_matches_holder(name, holder):
+            mismatches += 1
+            lines.append(
+                f"  - ⚠️ **NAME MISMATCH** — labelled `{name}`, but this account "
+                f"belongs to `{holder}`. Fix PROFILES before ordering."
+            )
+
+    if mismatches:
+        lines.append(
+            f"\n⚠️ **{mismatches} profile(s) do not match their account holder.** "
+            "Ordering on a mislabelled profile books meals for the wrong child. "
+            "The customer id in PROFILES cannot be checked against anything else, "
+            "so this name comparison is the only safeguard."
+        )
+    if unverified:
+        lines.append(
+            f"\n⚠️ {unverified} profile(s) could not be verified — do not assume "
+            "the label is correct."
+        )
     return "\n".join(lines)
 
 
@@ -704,10 +976,13 @@ def get_order_history(
     Args:
         profile: Profile name (e.g. "child1"). Optional if only one profile is configured.
         days_back: How many days back to look (default 60)
-        search: Optional search text to filter orders
+        search: Optional text filter, applied CLIENT-SIDE to the delivery date,
+            order date and description (e.g. "10.2026" or "Milchreis").
 
     Returns:
         List of past orders with dates, descriptions, and quantities.
+        A cancelled order is NOT removed: it appears as an extra row for the
+        same delivery date with a negative quantity, offsetting the original.
     """
     customer_id, password = _resolve_profile(profile)
     client = _get_client()
@@ -717,19 +992,35 @@ def get_order_history(
     date_from = (datetime.now() - timedelta(days=days_back)).strftime("%a %b %d %Y")
     date_to = datetime.now().strftime("%a %b %d %Y")
 
+    # NOTE: `search` is deliberately NOT forwarded to IBS5. Its own ?search=
+    # returns an empty table for orders that are demonstrably present in the
+    # unfiltered listing — a confident false negative. Filter what we parsed.
     resp = client.get(
         f"{BASE_URL}/Account/Orderhistory",
-        params={"from": date_from, "to": date_to, "search": search},
+        params={"from": date_from, "to": date_to},
         headers=get_headers,
     )
     resp.raise_for_status()
 
     orders = _parse_order_history(resp.text)
 
-    if not orders:
-        return f"No orders found for {profile or next(iter(_profiles))} in the last {days_back} days."
+    if search:
+        needle = search.strip().lower()
+        orders = [
+            o
+            for o in orders
+            if needle in o.get("description", "").lower()
+            or needle in o.get("delivery_date", "").lower()
+            or needle in o.get("order_date", "").lower()
+        ]
 
-    lines = [f"# Order History for {profile or next(iter(_profiles))} (last {days_back} days)\n"]
+    who = _who(profile)
+
+    if not orders:
+        suffix = f" matching {search!r}" if search else ""
+        return f"No orders found for {who} in the last {days_back} days{suffix}."
+
+    lines = [f"# Order History for {who} (last {days_back} days)\n"]
     for order in orders:
         lines.append(
             f"- **{order['delivery_date']}**: {order['description']} "
@@ -771,22 +1062,34 @@ def get_cart_status(
     total = data.get("totalItemsInCart", 0)
     # Money fields may arrive as numbers or German-formatted strings — coerce
     # defensively so formatting never crashes on a "10,50"-style value.
-    price = _parse_price(data.get("totalPriceInCart")) or 0.0
+    # Do NOT collapse a missing price to 0.0: "€0.00" reads as "this is free",
+    # when it actually means IBS5 published no price for this account.
+    price = _parse_price(data.get("totalPriceInCart"))
     credits = _parse_price(data.get("creditBalance"))
     remaining = _parse_price(data.get("remainingCredits"))
 
-    pname = profile or next(iter(_profiles), "?")
-    lines = [f"# Shopping Cart Status — {pname}\n"]
-    lines.append(f"- Items in cart: {items}")
-    lines.append(f"- Total items: {total}")
-    lines.append(f"- Total price: €{price:.2f}")
+    lines = [f"# Shopping Cart Status — {_who(profile)}\n"]
+    # These two counters disagree in practice (observed: 0 and 23 for a real
+    # 23-line cart), so label them by their source field rather than inventing
+    # a meaning. totalItemsInCart is the one that tracks reality.
+    lines.append(f"- Cart lines (itemsInCart): {items}")
+    lines.append(f"- Total quantity (totalItemsInCart): {total}")
+    if price is not None:
+        lines.append(f"- Total price: €{price:.2f}")
+    else:
+        lines.append("- Total price: not published by IBS5 for this account")
     if credits is not None:
         lines.append(f"- Credit balance: €{credits:.2f}")
     if remaining is not None:
         lines.append(f"- Remaining credits: €{remaining:.2f}")
-    # Show projected balance after the cart is paid for, when credit is known.
-    if credits is not None:
+    # Show projected balance after the cart is paid for, when BOTH are known.
+    if credits is not None and price is not None:
         lines.append(f"- Balance after cart: €{(credits - price):.2f}")
+    if items != total:
+        lines.append(
+            "\n⚠️ The two counters disagree — verify with get_order_history "
+            "after confirming rather than trusting either number."
+        )
 
     return "\n".join(lines)
 
@@ -845,9 +1148,8 @@ def add_to_cart(
     cart_data = cart_resp.json() if cart_resp.status_code == 200 else {}
     items_in_cart = cart_data.get("totalItemsInCart", "?")
 
-    pname = profile or next(iter(_profiles), "?")
     return (
-        f"Added to cart for {pname}: {quantity}x meal (line {menu_line_id}) "
+        f"Added to cart for {_who(profile)}: {quantity}x meal (line {menu_line_id}) "
         f"for {serve_date}. Cart now has {items_in_cart} item(s). "
         f"⚠️ NOT YET ORDERED — call confirm_order to finalize."
     )
@@ -860,7 +1162,12 @@ def remove_meal(
     profile: str = "",
     menu_group_id: str = "2",
 ) -> str:
-    """Remove a meal from the shopping cart (set quantity to 0).
+    """Stage a meal for removal by setting its cart quantity to 0.
+
+    ⚠️ This alone does NOT cancel an already-confirmed order. It only writes
+    quantity 0 into the cart, which expires silently if nothing follows. To
+    actually cancel a confirmed order use `cancel_order`, or call
+    `confirm_order` after this to commit the removal.
 
     Args:
         serve_date: Delivery date in YYYY-MM-DD format
@@ -884,8 +1191,12 @@ def remove_meal(
         0,
     )
 
-    pname = profile or next(iter(_profiles), "?")
-    return f"Removed meal (line {menu_line_id}) for {serve_date} from {pname}'s cart."
+    return (
+        f"Staged removal for {_who(profile)}: line {menu_line_id} on {serve_date} "
+        f"set to quantity 0 in the cart.\n"
+        "⚠️ NOT YET CANCELLED — call confirm_order to commit this, or use "
+        "cancel_order to do both steps and verify the result."
+    )
 
 
 @mcp.tool()
@@ -931,11 +1242,193 @@ def confirm_order(
     success = data.get("Success", False)
     message = data.get("Message", "")
 
-    pname = profile or next(iter(_profiles), "?")
+    who = _who(profile)
     if success:
-        return f"Order confirmed for {pname}! {items} item(s) ordered. Server: {message}"
-    else:
-        return f"Order failed for {pname}. Server: {message}"
+        return (
+            f"Cart confirmed for {who}: {items} cart line(s) submitted. "
+            f"Server: {message}\n"
+            "⚠️ That count is CART LINES, not meals added — a submitted line may "
+            "be a cancellation (quantity 0). Verify with get_order_history: "
+            "additions show qty 1, cancellations an offsetting qty -1."
+        )
+    return f"Order failed for {who}. Server: {message}"
+
+
+# IBS5 renders order-history dates as "30.10.2026" in live responses, but the
+# same fields are fed "Wed Jun 03 2026"-style strings elsewhere in the API, so
+# accept both rather than silently dropping every row on a format surprise.
+_HISTORY_DATE_FORMATS = ("%d.%m.%Y", "%a %b %d %Y", "%Y-%m-%d", "%d/%m/%Y")
+
+
+def _history_date_to_iso(value: str) -> str | None:
+    """Normalise an order-history date to YYYY-MM-DD, or None if unparseable."""
+    text = (value or "").strip()
+    for fmt in _HISTORY_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _cancelled_delivery_counts(orders: list[dict[str, str]]) -> dict[str, int]:
+    """Count negative-quantity (cancellation) rows per ISO delivery date.
+
+    IBS5 never deletes an order; a cancellation is an offsetting negative row.
+    Counting rather than set-membership is what lets a caller tell a NEW
+    cancellation from one left over by an earlier run — comparing before/after
+    snapshots, a stale -1 for the same date no longer looks like proof that
+    today's confirm did anything. Pure and testable.
+    """
+    counts: dict[str, int] = {}
+    for row in orders:
+        try:
+            qty = int(str(row.get("quantity", "")).strip())
+        except ValueError:
+            continue
+        if qty >= 0:
+            continue
+        iso = _history_date_to_iso(row.get("delivery_date", ""))
+        if iso is None:
+            continue
+        counts[iso] = counts.get(iso, 0) + 1
+    return counts
+
+
+def _cancelled_delivery_dates(orders: list[dict[str, str]]) -> set[str]:
+    """ISO dates carrying at least one cancellation row."""
+    return set(_cancelled_delivery_counts(orders))
+
+
+@mcp.tool()
+def cancel_order(
+    profile: str = "",
+    items: list[dict[str, Any]] | None = None,
+) -> str:
+    """Cancel already-confirmed orders, doing the full two-step IBS5 dance.
+
+    `remove_meal` on its own does NOT cancel a confirmed order — it only writes
+    quantity 0 into the cart, which expires silently. A cancellation is real
+    only once confirmed, at which point IBS5 books an offsetting negative-
+    quantity row (it never deletes the original). This tool stages every item,
+    confirms once, then re-reads the order history to verify which
+    cancellations actually landed.
+
+    Args:
+        profile: Profile name. Optional if only one profile is configured.
+        items: list of {serve_date, menu_line_id, menu_group_id?(default "2")}.
+
+    Returns:
+        Per-item staged/failed status, the server's confirm message, and a
+        VERIFIED/NOT-VERIFIED verdict per date from the re-read history.
+    """
+    customer_id, password = _resolve_profile(profile)
+    items = items or []
+    who = _who(profile)
+    if not items:
+        return f"No items given — nothing to cancel for {who}."
+
+    client = _get_client()
+    hdrs = _headers(customer_id, password)
+
+    def _snapshot() -> dict[str, int] | None:
+        """Cancellation counts per delivery date, or None if unreadable."""
+        try:
+            get_headers = {k: v for k, v in hdrs.items() if k != "Content-Type"}
+            hist = client.get(
+                f"{BASE_URL}/Account/Orderhistory",
+                params={
+                    "from": (datetime.now() - timedelta(days=120)).strftime(
+                        "%a %b %d %Y"
+                    ),
+                    # Reach well into the future: the portal's own default of
+                    # "to = today" hides exactly the rows we need to check.
+                    "to": (datetime.now() + timedelta(days=240)).strftime(
+                        "%a %b %d %Y"
+                    ),
+                },
+                headers=get_headers,
+            )
+            if hist.status_code != 200:
+                return None
+            return _cancelled_delivery_counts(_parse_order_history(hist.text))
+        except Exception:  # noqa: BLE001 — verification is best-effort
+            return None
+
+    # Snapshot BEFORE staging: a cancellation left over from an earlier run
+    # would otherwise be counted as proof that this call did something.
+    before = _snapshot()
+
+    staged: list[str] = []
+    failures: list[str] = []
+    for it in items:
+        serve_date = str(it.get("serve_date", ""))
+        menu_line_id = str(it.get("menu_line_id", ""))
+        menu_group_id = str(it.get("menu_group_id", "2") or "2")
+        try:
+            datetime.strptime(serve_date, "%Y-%m-%d")
+        except ValueError:
+            failures.append(f"{serve_date} line {menu_line_id}: bad date format")
+            continue
+        try:
+            _save_order(
+                client, customer_id, password,
+                serve_date, menu_line_id, menu_group_id, 0,
+            )
+            staged.append(serve_date)
+        except Exception as exc:  # noqa: BLE001 — report per-line, keep going
+            failures.append(f"{serve_date} line {menu_line_id}: {exc}")
+
+    lines = [f"# Cancel order — {who}\n"]
+    if not staged:
+        lines.append("Nothing staged; no confirm attempted.")
+        lines.extend(f"- ❌ {f}" for f in failures)
+        return "\n".join(lines)
+
+    resp = client.post(f"{BASE_URL}/Cart/Order", headers=hdrs, json={})
+    resp.raise_for_status()
+    data = resp.json()
+    message = data.get("Message", "")
+    if not data.get("Success", False):
+        lines.append(f"❌ Confirm FAILED — nothing was cancelled. Server: {message}")
+        return "\n".join(lines)
+
+    after = _snapshot()
+    verify_error = ""
+    if before is None or after is None:
+        verify_error = "order history could not be read before and/or after"
+
+    n_ok = 0
+    for serve_date in staged:
+        if before is None or after is None:
+            lines.append(
+                f"- ❔ {serve_date} — submitted, but could not be verified "
+                "(order history unreadable). Check manually."
+            )
+            continue
+        gained = after.get(serve_date, 0) - before.get(serve_date, 0)
+        if gained > 0:
+            n_ok += 1
+            lines.append(
+                f"- ✅ {serve_date} — cancelled (new offsetting -1 row booked)"
+            )
+        elif after.get(serve_date, 0) > 0:
+            lines.append(
+                f"- ⚠️ {serve_date} — a cancellation row exists but it is NOT new, "
+                "so this call changed nothing. Likely already cancelled earlier, "
+                "or past the cutoff."
+            )
+        else:
+            lines.append(
+                f"- ⚠️ {serve_date} — submitted, but NO offsetting -1 row appeared. "
+                "Likely past the cutoff; treat as STILL ORDERED."
+            )
+    lines.extend(f"- ❌ {f}" for f in failures)
+    lines.append("")
+    lines.append(f"**{n_ok}/{len(staged)} verified cancelled.** Server: {message}")
+    if verify_error:
+        lines.append(f"⚠️ Verification incomplete ({verify_error}) — re-check manually.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -954,13 +1447,16 @@ def _plan_lines(
 
     Each requested item: {serve_date, menu_line_id, menu_group_id?(default "2")}.
 
-    conflict ∈ {None, "no_school_day", "unknown_line", "not_orderable",
+    conflict ∈ {None, "no_school_day", "unknown_line", "not_orderable", "non_meal",
                 "already_ordered"} with that precedence.
 
-    Returns {lines, order_total, counts}.
+    Returns {lines, order_total, price_data_available, counts}.
+    order_total is None when IBS5 published no price for any line (it does not
+    for every school) — that is "unknown", not "free".
     """
     lines: list[dict[str, Any]] = []
     order_total = 0.0
+    priced_lines = 0
     orderable_count = 0
     conflict_count = 0
 
@@ -1003,7 +1499,11 @@ def _plan_lines(
                 already_ordered = match.get("current_quantity", 0)
                 orderable = not match.get("ordering_disabled", False)
                 tags = classify_meal(meal_name)
-                if match.get("ordering_disabled", False):
+                if _is_non_meal(meal_name):
+                    # "FERIEN" and friends occupy a normal menu slot.
+                    conflict = "non_meal"
+                    orderable = False
+                elif match.get("ordering_disabled", False):
                     conflict = "not_orderable"
                 elif already_ordered > 0:
                     conflict = "already_ordered"
@@ -1027,12 +1527,17 @@ def _plan_lines(
             parsed = _parse_price(price)
             if parsed is not None:
                 order_total += parsed
+                priced_lines += 1
         else:
             conflict_count += 1
 
+    # IBS5 leaves data-price empty for accounts whose school does not publish
+    # per-meal prices. Reporting 0.00 there reads as "this order is free"; None
+    # plus the flag says "unknown", which is the truth.
     return {
         "lines": lines,
-        "order_total": round(order_total, 2),
+        "order_total": round(order_total, 2) if priced_lines else None,
+        "price_data_available": bool(priced_lines),
         "counts": {"orderable": orderable_count, "conflicts": conflict_count},
     }
 
@@ -1171,7 +1676,9 @@ def plan_order(
         price, already_ordered, orderable, tags, conflict}, plus order_total
         (sum of prices for lines with conflict None and orderable True) and
         counts {orderable, conflicts}. conflict is one of None, "no_school_day",
-        "unknown_line", "not_orderable", "already_ordered".
+        "unknown_line", "not_orderable", "already_ordered", "non_meal".
+        order_total is None (not 0.0) when IBS5 published no price for any
+        line; price_data_available says which case you are in.
     """
     customer_id, password = _resolve_profile(profile)
     items = items or []
@@ -1216,7 +1723,13 @@ def plan_order(
             f"- {mark} **{line['serve_date']}** {label}: {meal}{price}{conf}"
         )
     out.append("")
-    out.append(f"**Order total (orderable lines): €{plan['order_total']:.2f}**")
+    if plan.get("order_total") is None:
+        out.append(
+            "**Order total: unknown** — IBS5 publishes no per-meal price for "
+            "this account, so no total can be computed (this is NOT €0.00)."
+        )
+    else:
+        out.append(f"**Order total (orderable lines): €{plan['order_total']:.2f}**")
     out.append(
         f"Orderable: {plan['counts']['orderable']} · "
         f"Conflicts: {plan['counts']['conflicts']}"
@@ -1356,7 +1869,7 @@ def bulk_add_to_cart(
     except Exception:  # noqa: BLE001
         pass
 
-    pname = profile or next(iter(_profiles), "?")
+    pname = _who(profile)
     n_ok = sum(1 for r in results if r["status"] == "ok")
     n_skip = sum(1 for r in results if r["status"] == "skip")
     n_fail = sum(1 for r in results if r["status"] == "fail")

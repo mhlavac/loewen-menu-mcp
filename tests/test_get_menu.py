@@ -97,6 +97,7 @@ def test_json_meal_shape(mock_server, monkeypatch):
         "max_quantity",
         "already_ordered",
         "orderable",
+        "non_meal",
         "tags",
     }
     assert meal["meal_name"] == "Linseneintopf"
@@ -127,3 +128,18 @@ def test_single_day_defaults_to_dataset(mock_server, monkeypatch):
         as_json=True,
     )
     assert [d["date"] for d in result] == ["2026-06-15"]
+
+
+def test_holiday_row_comes_back_non_orderable(mock_server, monkeypatch):
+    """A FERIEN marker sits in a normal menu slot with a working quantity input."""
+    _setup(mock_server, monkeypatch)
+    mock_server.weekplan_html = build_weekplan_html(
+        week_info="Week 43",
+        days={"2026-10-19": [{"menu_line_id": "10", "meal_name": "FERIEN"}]},
+    )
+    result = get_menu(
+        profile="child1", from_date="2026-10-19", to_date="2026-10-19", as_json=True
+    )
+    meal = result[0]["meals"][0]
+    assert meal["non_meal"] is True
+    assert meal["orderable"] is False

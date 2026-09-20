@@ -69,7 +69,9 @@ def test_conflict_no_school_day():
     )
     assert plan["lines"][0]["conflict"] == "no_school_day"
     assert plan["counts"]["conflicts"] == 1
-    assert plan["order_total"] == 0.0
+    # No priced line contributed, so the total is UNKNOWN, not free.
+    assert plan["order_total"] is None
+    assert plan["price_data_available"] is False
 
 
 def test_conflict_unknown_line():
@@ -99,7 +101,8 @@ def test_conflict_already_ordered():
     assert line["already_ordered"] == 1
     # orderable True but excluded from total because of the conflict
     assert line["orderable"] is True
-    assert plan["order_total"] == 0.0
+    assert plan["order_total"] is None
+    assert plan["price_data_available"] is False
 
 
 def test_order_total_only_counts_clean_orderable_lines():
@@ -155,3 +158,67 @@ def test_plan_order_tool_markdown(mock_server, monkeypatch):
     assert isinstance(out, str)
     assert "DRY RUN" in out
     assert "Order total" in out
+
+
+def test_priced_plan_reports_price_data_available():
+    by_date = _by_date()
+    plan = _plan_lines([{"serve_date": "2026-06-08", "menu_line_id": "8"}], by_date)
+    assert plan["price_data_available"] is True
+    assert isinstance(plan["order_total"], float)
+
+
+def test_holiday_marker_is_flagged_as_non_meal():
+    # IBS5 renders "FERIEN" in an ordinary menu slot with a working quantity
+    # input; it must never come back orderable.
+    by_date = {
+        "2026-10-19": [
+            {
+                "serve_date": "2026-10-19",
+                "menu_line_id": "10",
+                "menu_group_id": "2",
+                "line_label": "GS 3",
+                "meal_name": "FERIEN",
+                "price": None,
+                "current_quantity": 0,
+                "max_quantity": 2,
+                "ordering_disabled": False,
+            }
+        ]
+    }
+    plan = _plan_lines(
+        [{"serve_date": "2026-10-19", "menu_line_id": "10"}], by_date
+    )
+    line = plan["lines"][0]
+    assert line["conflict"] == "non_meal"
+    assert line["orderable"] is False
+    assert plan["counts"]["orderable"] == 0
+
+
+def test_plan_order_markdown_survives_missing_prices(mock_server, monkeypatch):
+    """Regression: the None order_total sentinel crashed the markdown renderer.
+
+    IBS5 publishes no per-meal price for many schools, so data-price is empty
+    and order_total is None. f"€{None:.2f}" raises TypeError, which took down
+    the whole plan_order tool for exactly the case the sentinel was added for.
+    """
+    monkeypatch.setattr(server, "_get_numeric_customer_id", lambda *a, **k: "12345")
+    mock_server.weekplan_html = build_weekplan_html(
+        week_info="Week 24",
+        days={
+            "2026-06-08": [
+                # price=None -> no data-price, exactly like the live server,
+                # which emits an empty data-price for schools without prices.
+                {"menu_line_id": "8", "meal_name": "Gemüsepfanne", "price": None},
+            ],
+        },
+    )
+    out = plan_order(
+        profile="child1",
+        items=[{"serve_date": "2026-06-08", "menu_line_id": "8"}],
+        as_json=False,
+    )
+    assert isinstance(out, str)
+    assert "unknown" in out.lower()
+    # Must not render a numeric total at all — a €0.00 here reads as "free".
+    assert "Order total (orderable lines):" not in out
+    assert "Orderable: 1" in out

@@ -132,6 +132,19 @@ class RecordingHandler:
         # (year, week) is present here it takes precedence over weekplan_html.
         self.weekplan_by_week: dict[tuple[int, int], str] = {}
         self.history_html = history_html
+        # Successive Orderhistory responses, popped in order before falling
+        # back to history_html. cancel_order reads the history twice (before
+        # and after confirming) and compares, so a test needs the second read
+        # to differ from the first.
+        self.history_sequence: list[str] = []
+        # JSON returned by /Login/Login — the only endpoint that reveals the
+        # account holder. Default is a synthetic holder.
+        self.login_json: dict = {
+            "name1": "Kind, Test          Wd-0001-",
+            "institutionName1": "GS Teststrasse",
+            "email": "test@example.invalid",
+            "token": "synthetic-token",
+        }
         # Cart payload returned by UpdateBalanceAndCart.
         self.cart_payload = {
             "itemsInCart": 0,
@@ -153,7 +166,11 @@ class RecordingHandler:
                 return httpx.Response(200, text=self.weekplan_by_week[key])
             return httpx.Response(200, text=self.weekplan_html)
         if path.endswith("/Account/Orderhistory"):
+            if self.history_sequence:
+                return httpx.Response(200, text=self.history_sequence.pop(0))
             return httpx.Response(200, text=self.history_html)
+        if path.endswith("/Login/Login"):
+            return httpx.Response(200, json=self.login_json)
         if path.endswith("/Mealplan/SaveOrder"):
             return httpx.Response(200, json={"Success": True})
         if path.endswith("/Mealplan/UpdateBalanceAndCart"):
@@ -177,8 +194,10 @@ class RecordingHandler:
 def _reset_caches():
     """Clear module-level caches between tests so they don't leak state."""
     server._customer_id_cache.clear()
+    server._account_cache.clear()
     yield
     server._customer_id_cache.clear()
+    server._account_cache.clear()
 
 
 @pytest.fixture
