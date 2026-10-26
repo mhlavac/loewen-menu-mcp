@@ -36,7 +36,7 @@ fabricated building codes (`Wd-0001-`), `*.invalid` e-mail domains. Placeholder 
 ## Tech Stack
 
 - Python 3.10, managed with **uv** (`uv.lock` + `pyproject.toml`)
-- **FastMCP** (`mcp` package) for the MCP server
+- **MCPServer** (`mcp` SDK v2, `mcp.server.mcpserver`; formerly FastMCP) for the MCP server
 - **httpx** (with SOCKS proxy support) for HTTP calls to IBS5
 - **BeautifulSoup4 + lxml** for HTML parsing of server-rendered pages
 

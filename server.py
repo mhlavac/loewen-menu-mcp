@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 from bs4 import BeautifulSoup
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -826,7 +826,7 @@ def _parse_price(price: Any) -> float | None:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
+mcp = MCPServer(
     "loewen-menu",
     instructions=(
         "MCP server for Löwen Menü IBS5 meal ordering system. "
